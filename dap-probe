@@ -1,0 +1,372 @@
+#!/usr/bin/python3
+"""debugpy を DAP で操作し、ブレークポイントで止まったときの値を JSON に記録する。
+
+nvim-dap を手で操作する代わりに、同じ debugpy に DAP クライアントとして繋ぐ。
+止まった位置のスタック、ローカル変数 (浅く)、指定した式の評価結果を記録して continue する。
+MR を並行で評価するときや、止めた値を後から読める形で残したいときに使う。
+
+使い方:
+  dap-probe --spec spec.json --out probe.json [--cwd DIR] [--env-file F] [--env K=V] [--port P]
+            [--debugpy-dir DIR] [--trigger 'shell cmd'] [--wait-port HOST:PORT] [--timeout 180]
+            -- <python> <args...>
+
+  <python> <args...> は debugpy 無しで起動するときのコマンド (例: .venv/bin/python -m pytest x.py)。
+  dap-probe は <python> -m debugpy --listen 127.0.0.1:P --wait-for-client <args...> に書き換えて起動する。
+  <python> の環境に debugpy が無いときは、debugpy の入った site-packages を --debugpy-dir で渡す
+  (PYTHONPATH の先頭に足す。site-packages 全体を渡すと別の版のライブラリを拾うので、debugpy だけの
+  ディレクトリを作ってシンボリックリンクを置くのがよい)。
+
+spec.json:
+  {"breakpoints": [{"file": "/abs/path.py", "line": 120, "condition": "x > 1",
+                    "eval": ["len(rows)", "area.id"], "max_hits": 3, "locals": true}],
+   "exceptions": ["uncaught"]}
+
+--trigger はブレークポイントを設定し終えた後に shell で実行する (例: curl -s http://127.0.0.1:8000/health)。
+--wait-port を付けると、その TCP ポートが開くのを待ってから trigger を実行する。
+trigger が終わり、新しい停止が 3 秒来なければ (または対象が終了したら) 対象を止めて終わる。
+
+記録の注意:
+  - def の行に置くと import 時に止まる。関数の本体の行に置く
+  - 式はそのフレームのローカルで評価する。外側のフレームの変数は見えない
+  - 複数行にまたがる文 (引数を改行した呼び出しなど) は、引数の評価の後に同じ行の line イベントが
+    もう一度出る。同じフレーム・同じ行で f_lasti だけが進んだ停止は記録せず、skipped_repeat_stops に数える
+  - 出力の隣に <out>.target.log (対象の stdout/stderr) と <out>.trigger.log (trigger の出力) を書く
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+
+def free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def read_env_file(path: str) -> dict:
+    env = {}
+    for raw in Path(path).read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:]
+        k, _, v = line.partition("=")
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+            v = v[1:-1]
+        env[k.strip()] = v
+    return env
+
+
+class Dap:
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.f = sock.makefile("rb")
+        self.seq = 0
+        self.lock = threading.Lock()
+        self.responses: dict[int, dict] = {}
+        self.events: list[dict] = []
+        self.cv = threading.Condition()
+        self.closed = False
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        try:
+            while True:
+                headers = {}
+                while True:
+                    line = self.f.readline()
+                    if not line:
+                        raise EOFError
+                    line = line.decode().strip()
+                    if not line:
+                        break
+                    k, _, v = line.partition(":")
+                    headers[k.strip().lower()] = v.strip()
+                body = self.f.read(int(headers["content-length"]))
+                msg = json.loads(body)
+                with self.cv:
+                    if msg["type"] == "response":
+                        self.responses[msg["request_seq"]] = msg
+                    elif msg["type"] == "event":
+                        self.events.append(msg)
+                    self.cv.notify_all()
+        except Exception:
+            with self.cv:
+                self.closed = True
+                self.cv.notify_all()
+
+    def send(self, command: str, arguments: dict | None = None) -> int:
+        with self.lock:
+            self.seq += 1
+            seq = self.seq
+            data = json.dumps({"seq": seq, "type": "request", "command": command, "arguments": arguments or {}}).encode()
+            self.sock.sendall(f"Content-Length: {len(data)}\r\n\r\n".encode() + data)
+        return seq
+
+    def wait_response(self, seq: int, timeout: float = 30) -> dict:
+        end = time.time() + timeout
+        with self.cv:
+            while seq not in self.responses:
+                if self.closed:
+                    raise EOFError("adapter closed")
+                left = end - time.time()
+                if left <= 0:
+                    raise TimeoutError(f"no response for seq {seq}")
+                self.cv.wait(left)
+            return self.responses.pop(seq)
+
+    def request(self, command: str, arguments: dict | None = None, timeout: float = 30) -> dict:
+        return self.wait_response(self.send(command, arguments), timeout)
+
+    def next_event(self, names: set[str], timeout: float) -> dict | None:
+        end = time.time() + timeout
+        with self.cv:
+            while True:
+                for i, e in enumerate(self.events):
+                    if e.get("event") in names:
+                        return self.events.pop(i)
+                if self.closed:
+                    return None
+                left = end - time.time()
+                if left <= 0:
+                    return None
+                self.cv.wait(min(left, 0.5))
+
+
+def short(v: str, n: int = 400) -> str:
+    return v if len(v) <= n else v[:n] + f"…(+{len(v) - n})"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--spec", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--cwd")
+    ap.add_argument("--env-file", action="append", default=[])
+    ap.add_argument("--env", action="append", default=[], help="KEY=VALUE")
+    ap.add_argument("--port", type=int)
+    ap.add_argument("--debugpy-dir", help="debugpy を import できるディレクトリ (PYTHONPATH の先頭に足す)")
+    ap.add_argument("--trigger")
+    ap.add_argument("--wait-port")
+    ap.add_argument("--timeout", type=float, default=180)
+    ap.add_argument("cmd", nargs=argparse.REMAINDER)
+    a = ap.parse_args()
+    cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
+    if len(cmd) < 2:
+        ap.error("-- <python> <args...> が要る")
+    spec = json.loads(Path(a.spec).read_text())
+    port = a.port or free_port()
+    env = dict(os.environ)
+    for f in a.env_file:
+        env.update(read_env_file(f))
+    for kv in a.env:
+        k, _, v = kv.partition("=")
+        env[k] = v
+    if a.debugpy_dir:
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (a.debugpy_dir, env.get("PYTHONPATH", "")) if p)
+    full = [cmd[0], "-X", "frozen_modules=off", "-m", "debugpy", "--listen", f"127.0.0.1:{port}", "--wait-for-client", *cmd[1:]]
+    log_path = Path(a.out).with_suffix(".target.log")
+    logf = open(log_path, "w")
+    proc = subprocess.Popen(full, cwd=a.cwd, env=env, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+    result = {"command": cmd, "cwd": a.cwd, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+              "hits": [], "exceptions": [], "trigger": None, "errors": [], "skipped_repeat_stops": 0}
+    sock = None
+    for _ in range(100):
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=1)
+            break
+        except OSError:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.2)
+    if sock is None:
+        result["errors"].append("debugpy に接続できなかった")
+        return finish(a, result, proc, logf)
+    sock.settimeout(None)
+    dap = Dap(sock)
+    dap.request("initialize", {"clientID": "dap-probe", "adapterID": "debugpy", "linesStartAt1": True,
+                               "columnsStartAt1": True, "pathFormat": "path"})
+    attach_seq = dap.send("attach", {"justMyCode": False, "subProcess": False, "redirectOutput": False})
+    dap.next_event({"initialized"}, 30)
+    by_file: dict[str, list[dict]] = {}
+    for bp in spec.get("breakpoints", []):
+        by_file.setdefault(str(Path(bp["file"]).resolve()), []).append(bp)
+    bp_index: dict[tuple[str, int], dict] = {}
+    for file, bps in by_file.items():
+        args = {"source": {"path": file},
+                "breakpoints": [{"line": b["line"], **({"condition": b["condition"]} if b.get("condition") else {})} for b in bps]}
+        r = dap.request("setBreakpoints", args)
+        for b, rb in zip(bps, r.get("body", {}).get("breakpoints", [])):
+            b["_hits"] = 0
+            b["_verified"] = rb.get("verified")
+            bp_index[(file, rb.get("line") or b["line"])] = b
+            bp_index.setdefault((file, b["line"]), b)
+    dap.request("setExceptionBreakpoints", {"filters": spec.get("exceptions", [])})
+    dap.request("configurationDone")
+    dap.wait_response(attach_seq, 30)
+    result["breakpoints"] = [{"file": f, "line": b["line"], "verified": b.get("_verified"), "condition": b.get("condition")}
+                             for f, bps in by_file.items() for b in bps]
+
+    trig = None
+    trig_out = Path(a.out).with_suffix(".trigger.log")
+
+    def start_trigger():
+        nonlocal trig
+        if not a.trigger:
+            return
+        if a.wait_port:
+            h, _, p = a.wait_port.rpartition(":")
+            for _ in range(600):
+                try:
+                    socket.create_connection((h, int(p)), timeout=1).close()
+                    break
+                except OSError:
+                    time.sleep(0.2)
+        trig = subprocess.Popen(a.trigger, shell=True, stdout=open(trig_out, "w"), stderr=subprocess.STDOUT)
+
+    threading.Thread(target=start_trigger, daemon=True).start()
+    deadline = time.time() + a.timeout
+    while time.time() < deadline:
+        ev = dap.next_event({"stopped", "terminated", "exited"}, 1.0)
+        if ev is None:
+            if dap.closed or proc.poll() is not None:
+                break
+            if a.trigger and trig is not None and trig.poll() is not None:
+                # trigger 終了後、少し待って新しい停止が無ければ終える
+                ev2 = dap.next_event({"stopped"}, 3.0)
+                if ev2 is None:
+                    break
+                ev = ev2
+            else:
+                continue
+        if ev.get("event") in ("terminated", "exited"):
+            break
+        body = ev.get("body", {})
+        tid = body.get("threadId")
+        try:
+            record_stop(dap, tid, body, bp_index, result)
+        except Exception as e:  # 記録に失敗しても continue する
+            result["errors"].append(f"record: {e!r}")
+        try:
+            dap.request("continue", {"threadId": tid})
+        except Exception as e:
+            result["errors"].append(f"continue: {e!r}")
+    else:
+        result["errors"].append(f"timeout {a.timeout}s")
+    if trig is not None:
+        try:
+            trig.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            trig.kill()
+        result["trigger"] = {"command": a.trigger, "returncode": trig.returncode,
+                             "output": short(trig_out.read_text(errors="replace"), 6000)}
+    try:
+        dap.send("disconnect", {"terminateDebuggee": True})
+    except Exception:
+        pass
+    return finish(a, result, proc, logf)
+
+
+def record_stop(dap: Dap, tid: int, body: dict, bp_index: dict, result: dict) -> None:
+    st = dap.request("stackTrace", {"threadId": tid, "startFrame": 0, "levels": 8})["body"]["stackFrames"]
+    top = st[0]
+    path = str(Path(top.get("source", {}).get("path", "")).resolve()) if top.get("source", {}).get("path") else ""
+    bp = bp_index.get((path, top["line"]))
+    reason = body.get("reason")
+    # 複数行にまたがる文 (引数を改行した呼び出しなど) は、引数を評価した後の呼び出しで同じ行の
+    # line イベントがもう一度出る。止まったフレームの id と f_lasti (実行中の命令の位置) を読み、
+    # 直前の停止と同じフレーム・同じ行で f_lasti だけが進んでいれば同じ文の続きとみなして記録しない。
+    # ループで同じ行に戻った場合は f_lasti が進まないので記録される
+    if reason != "exception" and path:
+        loc = frame_location(dap, top["id"], path, top["line"])
+        prev = result.get("_last_loc")
+        result["_last_loc"] = (tid, path, top["line"], loc)
+        if loc and prev and prev[:3] == (tid, path, top["line"]) and prev[3] and prev[3][0] == loc[0] and loc[1] > prev[3][1]:
+            result["skipped_repeat_stops"] = result.get("skipped_repeat_stops", 0) + 1
+            return
+    rec = {"reason": reason, "file": path, "line": top["line"], "function": top["name"],
+           "thread_id": tid, "event": {k: body.get(k) for k in ("threadId", "allThreadsStopped", "hitBreakpointIds", "description")},
+           "stack": [f'{f["name"]} {f.get("source", {}).get("path", "")}:{f["line"]}' for f in st]}
+    if reason == "exception":
+        try:
+            info = dap.request("exceptionInfo", {"threadId": tid})["body"]
+            rec["exception"] = {"id": info.get("exceptionId"), "description": short(info.get("description", ""), 2000)}
+        except Exception as e:
+            rec["exception"] = {"error": repr(e)}
+        result["exceptions"].append(rec)
+        return
+    if bp is not None:
+        bp["_hits"] += 1
+        if bp["_hits"] > bp.get("max_hits", 3):
+            return
+        rec["hit"] = bp["_hits"]
+    if bp is None or bp.get("locals", True):
+        scopes = dap.request("scopes", {"frameId": top["id"]})["body"]["scopes"]
+        loc = next((s for s in scopes if s["name"].lower().startswith("local")), None)
+        if loc:
+            vs = dap.request("variables", {"variablesReference": loc["variablesReference"]})["body"]["variables"]
+            rec["locals"] = {v["name"]: short(v.get("value", ""), 300) for v in vs
+                             if not v["name"].startswith("__") and v["name"] not in ("special variables", "function variables", "class variables")}
+    if bp is not None:
+        rec["eval"] = {}
+        for expr in bp.get("eval", []):
+            r = dap.request("evaluate", {"expression": expr, "frameId": top["id"], "context": "repl"})
+            rec["eval"][expr] = short(r["body"]["result"], 1500) if r.get("success") else f'ERROR: {r.get("message")}'
+    result["hits"].append(rec)
+
+
+FRAME_LOC_EXPR = (
+    "(lambda p, l: next(((id(f), f.f_lasti) for f in __import__('itertools').accumulate("
+    "range(300), lambda f, _: f.f_back if f is not None else None, initial=__import__('sys')._getframe()) "
+    "if f is not None and f.f_lineno == l and __import__('os').path.realpath(f.f_code.co_filename) == p), None))"
+)
+
+
+def frame_location(dap: Dap, frame_id: int, path: str, line: int):
+    """止まったフレームの (id, f_lasti) を返す。評価できなければ None。"""
+    try:
+        r = dap.request("evaluate", {"expression": f"{FRAME_LOC_EXPR}({path!r}, {line})", "frameId": frame_id, "context": "repl"})
+    except Exception:
+        return None
+    if not r.get("success"):
+        return None
+    try:
+        a, b = r["body"]["result"].strip("()").split(",")
+        return int(a), int(b)
+    except ValueError:
+        return None
+
+
+def finish(a, result, proc, logf) -> int:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=10)
+    except Exception:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+    logf.close()
+    result.pop("_last_loc", None)
+    result["target_returncode"] = proc.returncode
+    result["target_log_tail"] = Path(logf.name).read_text(errors="replace")[-4000:]
+    Path(a.out).write_text(json.dumps(result, ensure_ascii=False, indent=2))
+    print(f"hits={len(result['hits'])} exceptions={len(result['exceptions'])} errors={result['errors']} -> {a.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
