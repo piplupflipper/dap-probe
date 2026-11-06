@@ -1,20 +1,22 @@
-# dap-probe
+# dap-probe 🔍💅
 
-debugpy を Debug Adapter Protocol (DAP) で操作し、ブレークポイントで止まったときの値を JSON に記録するコマンドです。
-エディタで手動で止める代わりに、スタック、ローカル変数、指定した式の評価結果を記録して続行します。
+**English** | [日本語](README.ja.md)
 
-## 必要なもの
+This command drives debugpy over the Debug Adapter Protocol (DAP) and records the values at breakpoint hits as JSON 💖✨  
+Instead of stopping manually in your editor, it records the stack, local variables, and the results of the expressions you asked for, then keeps going 🏃‍♀️💨
+
+## 🛍️ Requirements
 
 - Python 3
-- 対象の Python 環境に入った `debugpy`。入っていないときは `--debugpy-dir` で場所を渡します。
+- `debugpy` installed in the target Python environment. If it isn't there, pass its location with `--debugpy-dir` 📁
 
-## 導入
+## 📦 Install
 
 ```sh
 install -m 755 dap-probe ~/.local/bin/dap-probe
 ```
 
-## 使い方
+## 🎀 Usage
 
 ```sh
 cat > spec.json <<'JSON'
@@ -28,17 +30,17 @@ dap-probe --spec spec.json --out probe.json \
   -- .venv/bin/python -m uvicorn main:app --port 8000
 ```
 
-`--` の後には、debugpy を使わないときの起動コマンドを書きます。
-`--trigger` はブレークポイントの設定後に実行するコマンドで、`--wait-port` はそのコマンドの前に開くのを待つ TCP ポートです。
-オプションと記録の注意点は `dap-probe` の冒頭に書いてあります。
+After `--`, write the command you'd use to start the app without debugpy 🚀  
+`--trigger` is a command that runs after the breakpoints are set, and `--wait-port` is the TCP port it waits to open before running that command ⏳  
+The options and recording caveats are written at the top of `dap-probe` 📝
 
-## テスト
+## 🧪 Tests
 
 ```sh
 pip install debugpy
 python3 tests/test_dap_probe.py
 ```
 
-## ライセンス
+## 📜 License
 
-MIT
+MIT 💖
